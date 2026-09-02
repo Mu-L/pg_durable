@@ -6,6 +6,10 @@ Pre-1.0 note: while `pg_durable` is in major version `0`, minor releases may inc
 
 ## [0.2.8] - Unreleased
 
+### Fixed
+
+- **Caller-transaction handoff:** `df.start()` now tracks the originating transaction until it commits or aborts, so legal caller transactions lasting more than five seconds no longer leave a `pending` `df.instances` row paired with a failed engine execution. Graph admission uses durable backoff and bounded-history compaction rather than holding a worker connection while it waits.
+
 ## [0.2.7] - 2026-08-31
 
 ### Added

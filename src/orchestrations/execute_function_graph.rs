@@ -17,6 +17,7 @@ use cron::Schedule as CronSchedule;
 use duroxide::OrchestrationContext;
 
 use crate::activities;
+use crate::activities::load_function_graph::{TransactionAwareLoadInput, TransactionGraphProbe};
 use crate::types::{
     evaluate_condition, string_map_to_json, substitute_all, substitute_all_raw, FunctionGraph,
     FunctionInput, FunctionNode, SystemVars,
@@ -121,6 +122,164 @@ impl From<&str> for NodeError {
 /// Result type for node handlers: `Ok` value string, or a typed control-flow/failure error.
 type NodeResult = Result<String, NodeError>;
 
+const INITIAL_TRANSACTION_POLL_MS: u64 = 100;
+const MAX_TRANSACTION_POLL_MS: u64 = 5_000;
+const GRAPH_WAIT_POLLS_PER_EXECUTION: u32 = 64;
+/// Bound on how many transient `Retry` outcomes (DB errors, query timeouts,
+/// snapshot-visibility lag - see `probe_transaction`) a single graph admission
+/// will absorb before failing the orchestration outright. Unlike waiting on
+/// the caller's own open transaction (`InProgress`, legitimately unbounded),
+/// these retries indicate the worker's own machinery is unhealthy, and
+/// polling forever would hide a permanent problem behind misleading
+/// "waiting on transaction" logs.
+const MAX_GRAPH_RETRY_ATTEMPTS: u32 = 20;
+
+/// Bound on how many times a *terminal* `df.instances` status write
+/// (`completed`/`failed`) is durably retried before the orchestration gives up.
+/// The engine execution is already terminal at these sites, so a dropped write
+/// would leave `df.status()` / `df.await_instance()` trusting a stale
+/// non-terminal row indefinitely. Retrying across durable timers lets a
+/// transient management-plane outage self-heal once the database recovers,
+/// while the bound still prevents an unhealthy worker from spinning forever.
+const MAX_STATUS_FINALIZE_ATTEMPTS: u32 = 20;
+
+fn transaction_poll_delay(attempt: u32) -> Duration {
+    let multiplier = 1u64 << attempt.min(6);
+    Duration::from_millis(
+        INITIAL_TRANSACTION_POLL_MS
+            .saturating_mul(multiplier)
+            .min(MAX_TRANSACTION_POLL_MS),
+    )
+}
+
+fn should_compact_graph_wait(polls_in_execution: u32) -> bool {
+    polls_in_execution >= GRAPH_WAIT_POLLS_PER_EXECUTION
+}
+
+/// Whether the bounded transient-retry budget for graph admission has been
+/// exhausted. Pure so the boundary (`== MAX_GRAPH_RETRY_ATTEMPTS` vs `>`) has
+/// direct unit coverage.
+fn graph_retry_budget_exceeded(retry_attempt: u32) -> bool {
+    retry_attempt > MAX_GRAPH_RETRY_ATTEMPTS
+}
+
+fn graph_wait_continuation(
+    input: &FunctionInput,
+    next_wait_attempt: u32,
+    next_retry_attempt: u32,
+) -> Result<String, serde_json::Error> {
+    let mut continuation = input.clone();
+    continuation.graph_wait_attempt = next_wait_attempt;
+    continuation.graph_retry_attempt = next_retry_attempt;
+    serde_json::to_string(&continuation)
+}
+
+async fn load_initial_graph(
+    ctx: &OrchestrationContext,
+    input: &FunctionInput,
+) -> Result<String, String> {
+    let Some(origin_xid) = input.origin_xid.as_ref() else {
+        // Replay compatibility: historical FunctionInput payloads have no xid.
+        // They must schedule the original activity name with the exact original
+        // raw instance-id input bytes.
+        return ctx
+            .schedule_activity(
+                activities::load_function_graph::NAME,
+                input.instance_id.clone(),
+            )
+            .await;
+    };
+
+    let probe_input = serde_json::to_string(&TransactionAwareLoadInput {
+        instance_id: input.instance_id.clone(),
+        origin_xid: origin_xid.clone(),
+    })
+    .map_err(|e| format!("Failed to serialize transaction-aware graph probe: {e}"))?;
+
+    let mut wait_attempt = input.graph_wait_attempt;
+    let mut retry_attempt = input.graph_retry_attempt;
+    let mut polls_in_execution = 0u32;
+    loop {
+        let raw = ctx
+            .schedule_activity(
+                activities::load_function_graph::TRANSACTION_AWARE_NAME,
+                probe_input.clone(),
+            )
+            .await?;
+        let probe: TransactionGraphProbe = serde_json::from_str(&raw)
+            .map_err(|e| format!("Failed to parse transaction-aware graph probe result: {e}"))?;
+
+        match probe {
+            TransactionGraphProbe::Ready { graph } => return Ok(graph),
+            TransactionGraphProbe::InProgress => {
+                let delay = transaction_poll_delay(wait_attempt);
+                ctx.trace_info(format!(
+                    "Instance {} graph is waiting on origin transaction {}; retrying in {:?}",
+                    input.instance_id, origin_xid, delay
+                ));
+                ctx.schedule_timer(delay).await;
+                wait_attempt = wait_attempt.saturating_add(1);
+                polls_in_execution = polls_in_execution.saturating_add(1);
+
+                if should_compact_graph_wait(polls_in_execution) {
+                    let continuation_json =
+                        graph_wait_continuation(input, wait_attempt, retry_attempt).map_err(
+                            |e| format!("Failed to serialize graph-wait continuation: {e}"),
+                        )?;
+                    ctx.trace_info(format!(
+                        "Compacting graph-admission history for instance {} after {} polls",
+                        input.instance_id, polls_in_execution
+                    ));
+                    return ctx.continue_as_new(continuation_json).await;
+                }
+            }
+            TransactionGraphProbe::Retry => {
+                retry_attempt = retry_attempt.saturating_add(1);
+                if graph_retry_budget_exceeded(retry_attempt) {
+                    return Err(format!(
+                        "Instance {} graph admission for origin transaction {} failed: \
+                         exceeded {MAX_GRAPH_RETRY_ATTEMPTS} transient retries",
+                        input.instance_id, origin_xid
+                    ));
+                }
+                let delay = transaction_poll_delay(retry_attempt);
+                ctx.trace_info(format!(
+                    "Instance {} graph admission for origin transaction {} hit a transient \
+                     failure ({}/{MAX_GRAPH_RETRY_ATTEMPTS}); retrying in {:?}",
+                    input.instance_id, origin_xid, retry_attempt, delay
+                ));
+                ctx.schedule_timer(delay).await;
+                polls_in_execution = polls_in_execution.saturating_add(1);
+
+                if should_compact_graph_wait(polls_in_execution) {
+                    let continuation_json =
+                        graph_wait_continuation(input, wait_attempt, retry_attempt).map_err(
+                            |e| format!("Failed to serialize graph-wait continuation: {e}"),
+                        )?;
+                    ctx.trace_info(format!(
+                        "Compacting graph-admission history for instance {} after {} polls",
+                        input.instance_id, polls_in_execution
+                    ));
+                    return ctx.continue_as_new(continuation_json).await;
+                }
+            }
+            TransactionGraphProbe::Aborted => {
+                return Err(format!(
+                    "Instance {} origin transaction {} aborted before its graph became visible",
+                    input.instance_id, origin_xid
+                ))
+            }
+            TransactionGraphProbe::CommittedMissing => {
+                return Err(format!(
+                    "Instance {} origin transaction {} committed but its instance graph is absent \
+                     (the start may have been rolled back to a savepoint)",
+                    input.instance_id, origin_xid
+                ))
+            }
+        }
+    }
+}
+
 /// Distinguishes a normal subtree result from one that unwound via `df.break()`.
 ///
 /// Stored as `Option<SubtreeControl>` in the envelope (see `SubtreeEnvelope::control`): a
@@ -148,6 +307,58 @@ struct SubtreeEnvelope {
     result: String,
     #[serde(serialize_with = "crate::types::serialize_string_map")]
     results: HashMap<String, String>,
+}
+
+/// Durably drive a *terminal* `df.instances` status write to completion.
+///
+/// The engine execution is already terminal when this is called, so a
+/// best-effort write that is silently dropped on a transient database/pool
+/// failure would leave `df.status()` / `df.await_instance()` trusting a stale
+/// non-terminal (`pending`/`running`) row while the engine is finished — the
+/// two status surfaces diverging indefinitely. Retry the update activity across
+/// durable timers so a transient management-plane outage self-heals once the
+/// database recovers. The retry budget is bounded (`MAX_STATUS_FINALIZE_ATTEMPTS`)
+/// so a persistently unhealthy worker cannot spin forever; on exhaustion the
+/// divergence is at least surfaced in the trace rather than hidden.
+///
+/// This is deterministic: activity results and timer fires are recorded in
+/// history, so replay follows the same attempt sequence.
+async fn finalize_instance_status(ctx: &OrchestrationContext, instance_id: &str, status: &str) {
+    let status_input = serde_json::json!({
+        "instance_id": instance_id,
+        "status": status,
+    })
+    .to_string();
+
+    let mut attempt = 0u32;
+    loop {
+        match ctx
+            .schedule_activity(
+                activities::update_instance_status::NAME,
+                status_input.clone(),
+            )
+            .await
+        {
+            Ok(_) => return,
+            Err(e) => {
+                if attempt >= MAX_STATUS_FINALIZE_ATTEMPTS {
+                    ctx.trace_info(format!(
+                        "Instance {instance_id}: giving up finalizing status to '{status}' after \
+                         {MAX_STATUS_FINALIZE_ATTEMPTS} attempts; df.instances may remain \
+                         non-terminal while the engine execution is terminal: {e}"
+                    ));
+                    return;
+                }
+                let delay = transaction_poll_delay(attempt);
+                ctx.trace_info(format!(
+                    "Instance {instance_id}: finalizing status to '{status}' failed \
+                     (attempt {attempt}/{MAX_STATUS_FINALIZE_ATTEMPTS}); retrying in {delay:?}: {e}"
+                ));
+                ctx.schedule_timer(delay).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
 }
 
 /// Execute a complete function graph — the entry point for a durable function.
@@ -190,27 +401,15 @@ pub async fn execute(ctx: OrchestrationContext, input_json: String) -> Result<St
     // instead of being ignored.
     let graph_json = match input.graph.clone() {
         Some(json) => json,
-        None => match ctx
-            .schedule_activity(
-                activities::load_function_graph::NAME,
-                input.instance_id.clone(),
-            )
-            .await
-        {
+        None => match load_initial_graph(&ctx, &input).await {
             Ok(json) => json,
             Err(e) => {
                 // load_function_graph failed (e.g., superuser blocked).
-                // Mark the instance as failed before propagating.
-                let status_input = serde_json::json!({
-                    "instance_id": input.instance_id,
-                    "status": "failed"
-                });
-                let _ = ctx
-                    .schedule_activity(
-                        activities::update_instance_status::NAME,
-                        status_input.to_string(),
-                    )
-                    .await;
+                // Mark the instance as failed before propagating. The engine
+                // execution is about to end terminally, so this terminal write
+                // is retried durably rather than dropped — otherwise the row
+                // would stay non-terminal while the engine is failed.
+                finalize_instance_status(&ctx, &input.instance_id, "failed").await;
                 return Err(e);
             }
         },
@@ -270,29 +469,11 @@ pub async fn execute(ctx: OrchestrationContext, input_json: String) -> Result<St
     match &function_result {
         Ok(result) => {
             ctx.trace_info(format!("Function completed with result: {result}"));
-            let status_input = serde_json::json!({
-                "instance_id": input.instance_id,
-                "status": "completed"
-            });
-            let _ = ctx
-                .schedule_activity(
-                    activities::update_instance_status::NAME,
-                    status_input.to_string(),
-                )
-                .await;
+            finalize_instance_status(&ctx, &input.instance_id, "completed").await;
         }
         Err(err) => {
             ctx.trace_info(format!("Function failed with error: {err}"));
-            let status_input = serde_json::json!({
-                "instance_id": input.instance_id,
-                "status": "failed"
-            });
-            let _ = ctx
-                .schedule_activity(
-                    activities::update_instance_status::NAME,
-                    status_input.to_string(),
-                )
-                .await;
+            finalize_instance_status(&ctx, &input.instance_id, "failed").await;
         }
     }
 
@@ -992,6 +1173,9 @@ async fn execute_loop_node(
                 vars: exec_ctx.vars.clone(),
                 loop_iteration: next_iteration,
                 graph: Some(graph_json),
+                origin_xid: None,
+                graph_wait_attempt: 0,
+                graph_retry_attempt: 0,
             };
             serde_json::to_string(&new_input)
                 .map_err(|e| format!("Failed to serialize loop input: {e}"))?
@@ -1801,6 +1985,56 @@ mod tests {
             Ok(v) => v,
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transaction_poll_backoff_is_deterministic_and_capped() {
+        assert_eq!(transaction_poll_delay(0), Duration::from_millis(100));
+        assert_eq!(transaction_poll_delay(1), Duration::from_millis(200));
+        assert_eq!(transaction_poll_delay(5), Duration::from_millis(3_200));
+        assert_eq!(transaction_poll_delay(6), Duration::from_millis(5_000));
+        assert_eq!(
+            transaction_poll_delay(u32::MAX),
+            Duration::from_millis(5_000)
+        );
+        assert!(!should_compact_graph_wait(
+            GRAPH_WAIT_POLLS_PER_EXECUTION - 1
+        ));
+        assert!(should_compact_graph_wait(GRAPH_WAIT_POLLS_PER_EXECUTION));
+        assert!(should_compact_graph_wait(u32::MAX));
+    }
+
+    #[test]
+    fn graph_wait_compaction_preserves_admission_state_only() {
+        let input = FunctionInput {
+            instance_id: "deadbeef".to_string(),
+            label: Some("waiting".to_string()),
+            vars: HashMap::from([("key".to_string(), "value".to_string())]),
+            loop_iteration: 7,
+            graph: None,
+            origin_xid: Some("12345".to_string()),
+            graph_wait_attempt: 63,
+            graph_retry_attempt: 2,
+        };
+
+        let json = graph_wait_continuation(&input, 64, 3).unwrap();
+        let continued: FunctionInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(continued.instance_id, input.instance_id);
+        assert_eq!(continued.label, input.label);
+        assert_eq!(continued.vars, input.vars);
+        assert_eq!(continued.loop_iteration, 7);
+        assert_eq!(continued.graph, None);
+        assert_eq!(continued.origin_xid.as_deref(), Some("12345"));
+        assert_eq!(continued.graph_wait_attempt, 64);
+        assert_eq!(continued.graph_retry_attempt, 3);
+    }
+
+    #[test]
+    fn graph_retry_budget_exceeded_allows_exactly_max_attempts() {
+        assert!(!graph_retry_budget_exceeded(0));
+        assert!(!graph_retry_budget_exceeded(MAX_GRAPH_RETRY_ATTEMPTS));
+        assert!(graph_retry_budget_exceeded(MAX_GRAPH_RETRY_ATTEMPTS + 1));
+        assert!(graph_retry_budget_exceeded(u32::MAX));
     }
 
     #[test]

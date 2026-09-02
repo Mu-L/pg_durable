@@ -112,13 +112,34 @@ pub fn is_role_superuser_oid(role_oid: pgrx::pg_sys::Oid) -> Result<bool, String
 /// Returns `true` if the role identified by `role_name` is a PostgreSQL superuser.
 /// Issues a single async query against `pg_catalog.pg_roles` using the provided pool.
 /// Must be called from an async context (background worker).
+///
+/// The lookup runs inside a short-lived transaction that applies server-side
+/// `statement_timeout` / `lock_timeout`, so a probe that blocks (e.g. behind a
+/// conflicting lock on the role catalog) is cancelled by PostgreSQL and its
+/// connection returned cleanly to the pool, rather than pinning a management
+/// connection until a client-side deadline drops the in-flight future.
 pub async fn is_role_superuser_name(pool: &sqlx::PgPool, role_name: &str) -> Result<bool, String> {
-    sqlx::query_scalar::<_, bool>("SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = $1")
-        .bind(role_name)
-        .fetch_optional(pool)
+    let err = |e: sqlx::Error| format!("superuser check failed for role '{}': {}", role_name, e);
+    let mut tx = pool.begin().await.map_err(err)?;
+    sqlx::query("SET LOCAL statement_timeout = '1500ms'")
+        .execute(&mut *tx)
         .await
-        .map_err(|e| format!("superuser check failed for role '{}': {}", role_name, e))
-        .and_then(|opt| opt.ok_or_else(|| format!("role '{}' not found in pg_roles", role_name)))
+        .map_err(err)?;
+    sqlx::query("SET LOCAL lock_timeout = '1500ms'")
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+    let result = sqlx::query_scalar::<_, bool>(
+        "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = $1",
+    )
+    .bind(role_name)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(err)
+    .and_then(|opt| opt.ok_or_else(|| format!("role '{}' not found in pg_roles", role_name)));
+    // Read-only transaction: a rollback failure cannot change the result.
+    let _ = tx.rollback().await;
+    result
 }
 
 /// Maximum nesting depth for workflow graphs. Bounds recursive graph walkers
@@ -1249,6 +1270,10 @@ pub struct FunctionGraph {
     pub nodes: std::collections::BTreeMap<String, FunctionNode>,
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// Input structure passed to duroxide functions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionInput {
@@ -1268,6 +1293,28 @@ pub struct FunctionInput {
     /// once no matter how many iterations it runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<String>,
+    /// Top-level transaction that owns the initial df.instances/df.nodes writes.
+    ///
+    /// New starts carry this so graph loading can distinguish a still-open caller
+    /// transaction from a rollback. Historical inputs omit it and retain the
+    /// legacy bounded graph-load activity for replay compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_xid: Option<String>,
+    /// Number of graph-admission polls already made for `origin_xid`.
+    ///
+    /// Kept separate from `loop_iteration`: admission can compact its history
+    /// with continue_as_new before user graph execution begins.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub graph_wait_attempt: u32,
+    /// Number of transient graph-admission `Retry` outcomes already observed
+    /// for `origin_xid` (DB errors, query timeouts, snapshot-visibility lag).
+    ///
+    /// Tracked independently from `graph_wait_attempt`: waiting on the
+    /// caller's own open transaction (`InProgress`) is legitimately
+    /// unbounded, but waiting on the worker's own machinery is not, so it is
+    /// bounded separately (see `MAX_GRAPH_RETRY_ATTEMPTS`).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub graph_retry_attempt: u32,
 }
 
 pub(crate) fn serialize_string_map<S>(
@@ -2196,6 +2243,9 @@ mod tests {
             vars: forward,
             loop_iteration: 0,
             graph: None,
+            origin_xid: None,
+            graph_wait_attempt: 0,
+            graph_retry_attempt: 0,
         };
         let reverse_input = FunctionInput {
             instance_id: "instance".to_string(),
@@ -2203,10 +2253,65 @@ mod tests {
             vars: reverse,
             loop_iteration: 0,
             graph: None,
+            origin_xid: None,
+            graph_wait_attempt: 0,
+            graph_retry_attempt: 0,
         };
         assert_eq!(
             serde_json::to_string(&forward_input).unwrap(),
             serde_json::to_string(&reverse_input).unwrap()
+        );
+    }
+
+    #[test]
+    fn function_input_origin_xid_is_backward_compatible() {
+        let legacy_json = r#"{"instance_id":"abc12345","label":null,"vars":{},"loop_iteration":0}"#;
+        let legacy: FunctionInput = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.origin_xid, None);
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("origin_xid"));
+
+        let current = FunctionInput {
+            instance_id: "abc12345".to_string(),
+            label: None,
+            vars: std::collections::HashMap::new(),
+            loop_iteration: 0,
+            graph: None,
+            origin_xid: Some("123456".to_string()),
+            graph_wait_attempt: 0,
+            graph_retry_attempt: 0,
+        };
+        let current_json = serde_json::to_string(&current).unwrap();
+        assert!(current_json.ends_with(r#","origin_xid":"123456"}"#));
+        assert_eq!(
+            serde_json::from_str::<FunctionInput>(&current_json)
+                .unwrap()
+                .origin_xid
+                .as_deref(),
+            Some("123456")
+        );
+
+        let compacted = FunctionInput {
+            graph_wait_attempt: 64,
+            ..current
+        };
+        let compacted_json = serde_json::to_string(&compacted).unwrap();
+        assert!(compacted_json.ends_with(r#","graph_wait_attempt":64}"#));
+
+        let retry_compacted = FunctionInput {
+            graph_retry_attempt: 3,
+            ..compacted
+        };
+        let retry_compacted_json = serde_json::to_string(&retry_compacted).unwrap();
+        assert!(
+            retry_compacted_json.ends_with(r#","graph_wait_attempt":64,"graph_retry_attempt":3}"#)
+        );
+        assert_eq!(
+            serde_json::from_str::<FunctionInput>(&retry_compacted_json)
+                .unwrap()
+                .graph_retry_attempt,
+            3
         );
     }
 
