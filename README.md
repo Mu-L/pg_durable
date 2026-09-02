@@ -159,7 +159,58 @@ on the build command to enable an HTTP policy feature. `DESTDIR` may be set on
 `sudo make uninstall PG_CONFIG="$PG_CONFIG"` removes the installed files again.
 It needs no build, so it also works from an unbuilt source tree.
 
-The extension is also distributed on [PGXN](https://pgxn.org/dist/pg_durable/), the PostgreSQL Extension Network. PGXN carries the **source** distribution, built and installed exactly as described above, so it needs the Rust toolchain and cargo-pgrx. For prebuilt binaries use the Debian packages or the Docker image.
+### Installing from PGXN
+
+The extension is listed on [PGXN](https://pgxn.org/dist/pg_durable/), the
+PostgreSQL Extension Network. **PGXN carries the source distribution, not a
+binary**: `pgxn install` downloads the source and compiles it on your machine,
+so it needs the same toolchain as a source-archive build and takes several
+minutes. For prebuilt binaries use the Debian packages or the Docker image
+above.
+
+Prerequisites:
+
+- PostgreSQL 17 or 18, including development headers and `pg_config`
+  (`postgresql-server-dev-17` on Debian/Ubuntu)
+- A Rust toolchain — see [rustup](https://rustup.rs)
+- [pgxnclient](https://pgxn.github.io/pgxnclient/) (`pip install pgxnclient`)
+- cargo-pgrx, matching the `pgrx` version pinned in `Cargo.toml`:
+
+  ```bash
+  cargo install --locked cargo-pgrx --version 0.16.1
+  ```
+
+Then, for a PostgreSQL installed from a package:
+
+```bash
+pgxn install --sudo -- pg_durable
+```
+
+Both parts of `--sudo --` are load-bearing. `pgxn install` elevates only when
+told to, so without `--sudo` it stops before building:
+
+```
+ERROR: PostgreSQL library directory (...) not writable: you should run the
+program as superuser, or specify a 'sudo' program
+```
+
+The build itself still runs as your user; only the install step is elevated. The
+`--` separator is required because `--sudo` takes an optional program name and
+would otherwise swallow `pg_durable` as that argument, leaving no distribution to
+install. If `pg_config --libdir` is writable by your user — a PostgreSQL you
+built yourself, for instance — plain `pgxn install pg_durable` works.
+
+`make package` registers your PostgreSQL with cargo-pgrx automatically the first
+time, so no separate `cargo pgrx init` step is needed. From a source checkout you
+can also run `make install-pgrx` to install the pinned cargo-pgrx, or
+`make pgrx-init PG_CONFIG="$PG_CONFIG"` to register PostgreSQL explicitly; set
+`PGRX_AUTO_INIT=0` to make the build report the command to run instead of
+initializing on its own.
+
+Afterwards, add `pg_durable` to `shared_preload_libraries`, restart PostgreSQL,
+and run `CREATE EXTENSION pg_durable` as described above.
+
+`pgxn uninstall --sudo -- pg_durable` removes the installed files again.
 
 ## Development Installation
 
