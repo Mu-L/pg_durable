@@ -28,7 +28,7 @@ In a Codespace or VS Code Dev Container, Rust, pgrx, and PostgreSQL 17 are alrea
 
 ```bash
 cargo fmt -p pg_durable -- --check
-cargo check --features pg17
+cargo check --locked --features pg17
 ```
 
 For an E2E scenario, run the matching SQL test by filename prefix or name:
@@ -52,8 +52,8 @@ Before opening a pull request, run the checks relevant to your change:
 
 ```bash
 cargo fmt -p pg_durable -- --check
-cargo build --features pg17
-cargo clippy --features pg17
+cargo build --locked --features pg17
+cargo clippy --locked --features pg17
 ./scripts/test-unit.sh
 ./scripts/test-e2e-local.sh
 ```
@@ -63,3 +63,14 @@ For extension schema changes, also run the upgrade tests:
 ```bash
 ./scripts/test-upgrade.sh
 ```
+
+### Dependency updates
+
+Keep `Cargo.toml` and `Cargo.lock` consistent. After editing a requirement, regenerate the lockfile with Cargo and check it with `--locked`. A newer version that already fits the requirement may change only the lockfile. Do not let a routine build rewrite the committed graph.
+
+[Dependabot](.github/dependabot.yml) updates ordinary Cargo requirements automatically. These dependencies are excluded from version-update and security-update pull requests, so watch them manually. Alerts still open.
+
+- Upgrade `pgrx` and `pgrx-tests` together, including `cargo-pgrx`.
+- Upgrade `duroxide` and `duroxide-pg` as a compatible pair.
+
+Review pre-1.0 minor upgrades as potentially breaking. CI checks the lockfile with `cargo metadata --locked` and fails if packaging or tests change `Cargo.lock`.
